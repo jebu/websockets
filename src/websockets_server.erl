@@ -1,0 +1,215 @@
+%%%-------------------------------------------------------------------
+%%% File:      websockets_server.erl
+%%% @author    Jebu Ittiachen <jebu@jebu.net> [http://blog.jebu.net/]
+%%% @copyright 2010 Jebu Ittiachen
+%%%
+%%% Permission is hereby granted, free of charge, to any person obtaining a copy
+%%% of this software and associated documentation files (the "Software"), to deal
+%%% in the Software without restriction, including without limitation the rights
+%%% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+%%% copies of the Software, and to permit persons to whom the Software is
+%%% furnished to do so, subject to the following conditions:
+%%%
+%%% The above copyright notice and this permission notice shall be included in
+%%% all copies or substantial portions of the Software.
+%%%
+%%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+%%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+%%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+%%% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+%%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+%%% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+%%% THE SOFTWARE.
+%%%
+%%% @doc  
+%%%
+%%% @end  
+%%%
+%%% @since 2010-08-26 by Jebu Ittiachen
+%%%-------------------------------------------------------------------
+-module(websockets_server).
+-author('jebu@jebu.net').
+-behaviour(gen_server).
+
+-compile([verbose, report_errors, report_warnings, trace, debug_info]).
+-define(TCP_OPTIONS, [list, {active, true}, {reuseaddr, true}, {packet, raw}]).
+
+-export([start_link/2, stop/0]).
+-export([send/1, send/2, close/0, close/1]).
+
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, 
+        terminate/2, code_change/3]).
+
+% websockets_server external interface
+
+start_link(Port, Interface) ->
+  error_logger:info_report([{"WebSockets SERVER STARTS"}]),
+  case gen_server:start_link({local, websockets_server}, websockets_server, [], []) of
+    {ok, Server} -> 
+      gen_server:call(websockets_server, {listen, Port, Interface}),
+      {ok, Server};
+    {error, {already_started, Server}} -> 
+      {ok, Server}
+  end.
+
+stop() ->
+  gen_server:call(websockets_server, stop).
+%
+send(Data) ->
+  send(self(), Data).
+send(Pid, Data) when is_list(Data) ->
+  Pid ! {send, list_to_binary(Data)};
+send(Pid, Data) when is_binary(Data) ->
+  Pid ! {send, Data};
+send(Pid, Data) ->
+  Pid ! {send, term_to_binary(Data)}.
+%
+close() ->
+  close(self()).
+close(Pid) ->
+  Pid ! {close}.
+% gen_server callbacks
+init(_Args) ->
+  process_flag(trap_exit, true),
+  {ok, {}}.
+
+handle_call({listen, Port, all}, _From, State) ->
+  listen_init(Port, ?TCP_OPTIONS, State);
+
+handle_call({listen, Port, Interface}, _From, State) ->
+  {ok, InterfaceIpAddress} = inet_parse:address(Interface),
+  listen_init(Port, [{ip, InterfaceIpAddress} | ?TCP_OPTIONS], State);
+
+handle_call(stop, _From, LSocket) -> 
+  gen_tcp:close(LSocket),
+  {stop, stop_requested, []}.
+
+handle_info({'EXIT', _Pid, _Reason}, LSocket) -> 
+  gen_tcp:close(LSocket),
+  {noreply, []}.
+%
+listen_init(Port, TcpOptions, State) ->
+  case catch gen_tcp:listen(Port, TcpOptions) of
+    {ok, LSocket} -> 
+      spawn_link(fun() -> websockets_worker(LSocket) end),
+      {reply, ok, LSocket};
+    Error -> 
+      {stop, {listen_failed, Error}, State}
+  end.
+%
+websockets_worker(LSocket) ->
+  case gen_tcp:accept(LSocket) of
+    {ok, Socket} -> 
+      CPid = spawn(fun() -> websockets_handshake(Socket) end),
+      gen_tcp:controlling_process(Socket, CPid),
+      websockets_worker(LSocket);
+    {error, closed} -> 
+      gen_tcp:close(LSocket)
+  end.
+        
+% callback stubs
+terminate(_Reason, []) -> 
+  ok;
+terminate(_Reason, LSocket) -> 
+  gen_tcp:close(LSocket),
+  ok.
+
+handle_cast(_Cast, State) -> {noreply, State}.
+
+code_change(_OldVsn, State, _Extra) -> {ok, State}.
+%
+% internal stuff
+%
+websockets_handshake(Socket) ->
+  receive
+    {tcp, Socket, Data} ->
+      {Headers, CSum} = parse_handshake(Data),
+      Origin = proplists:get_value("origin", Headers, "null"),
+      Host = proplists:get_value("host", Headers, "localhost:8010"),
+      [HandlerString | _] = string:tokens(proplists:get_value("get", Headers, "websockets_handler"), "/ "),
+      Handshake = [
+        "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
+        "Upgrade: WebSocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
+        "Sec-WebSocket-Location: ws://" ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
+        binary_to_list(CSum)
+      ],
+      gen_tcp:send(Socket, Handshake),
+      websockets_wait_messages(Socket, {[], list_to_atom(HandlerString), []});
+    Any ->
+      error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
+      websockets_handshake(Socket)
+  end.
+%
+websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
+  receive
+    {tcp, Socket, Data} ->
+      {Rest, CState} = handle_data(Buffer, Data, Handler, CState),
+      websockets_wait_messages(Socket, {Rest, Handler, CState});
+    {tcp_closed, Socket} ->
+      error_logger:info_msg("WebSockets stream terminated ~n"),
+      erlang:apply(Handler, terminate, [CState]),
+      ok;
+    {send, Data} ->
+      gen_tcp:send(Socket, <<0, Data/binary, 255>>),
+      websockets_wait_messages(Socket, State);
+    {close} ->
+      gen_tcp:close(Socket),
+      erlang:apply(Handler, terminate, [CState]),
+      ok;
+    Any ->
+      error_logger:info_msg("Got unknown message ~p ~n", [Any]),
+      websockets_wait_messages(Socket, State)
+  end.
+%
+handle_data([], [0|T], Handler, State) ->
+  handle_data([], T, Handler, State);
+handle_data(Buffer, [], _, State) ->
+  {Buffer, State};
+handle_data(Buffer, T, Handler, State) when length(Buffer) > 512 ->
+  % too many bytes in buffer we skip
+  handle_data([], T, Handler, State);
+handle_data(L, [255|T], Handler, State) ->
+  Line = lists:reverse(L),
+  NState = erlang:apply(Handler, process_command, [Line, State]),
+  handle_data([], T, Handler, NState);
+handle_data(L, [H|T], Handler, State) ->
+  handle_data([H|L], T, Handler, State).
+%
+parse_handshake(Bytes) ->
+  {Headers1, CheckSum} = lists:split(length(Bytes) - 8, Bytes),
+  Headers2 = string:tokens(Headers1, "\r\n"),
+  {Headers, Key1, Key2} = 
+    lists:foldl(fun
+      ([[$G, $E, $T, $  | GetHeader]| []], {Acc, K1, K2}) ->
+        {[{"get", GetHeader} | Acc], K1, K2};
+      ([_| []], Acc) ->
+        Acc;
+      ([Key| Val], {Acc, K1, K2}) ->
+        [_ | Val1] = string:join(Val, ":"),
+        case string:to_lower(Key) of
+          "sec-websocket-key1" -> {[{"sec-websocket-key1", Val1} | Acc], parse_key(Val1), K2};
+          "sec-websocket-key2" -> {[{"sec-websocket-key2", Val1} | Acc], K1, parse_key(Val1)};
+          Key1 -> {[{Key1, Val1} | Acc], K1, K2}
+        end;
+      (_, Acc) ->
+        Acc
+    end, {[], "1", "1"},
+      [string:tokens(H1, ":") || H1 <- Headers2]),
+  CSum = erlang:md5(<<Key1:32/big, Key2:32/big, (list_to_binary(CheckSum))/binary>>),
+  {Headers, CSum}.
+%
+parse_key(Key) ->
+  parse_key(Key, [], 0).
+parse_key([], Numbers, 0) ->
+  erlang:list_to_integer(lists:reverse(Numbers));
+parse_key([], Numbers, Spaces) ->
+  erlang:list_to_integer(lists:reverse(Numbers)) div Spaces;
+parse_key([32 | Key], Numbers, Spaces) ->
+  parse_key(Key, Numbers, Spaces + 1);
+parse_key([C | Key], Numbers, Spaces) when C > 47 andalso C < 58 ->
+  parse_key(Key, [C|Numbers], Spaces);
+parse_key([_ | Key], Numbers, Spaces) ->
+  parse_key(Key, Numbers, Spaces).
+%

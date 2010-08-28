@@ -1,0 +1,48 @@
+<html>
+<head>
+<script src="http://ajax.googleapis.com/ajax/libs/jquery/1.4.2/jquery.min.js" type="text/javascript"></script>
+</head>
+<body>
+<h1>WebSockets Test</h1>
+
+<div id="debug"></div>
+
+<script>
+$(document).ready(function(){
+
+  var ws;
+
+  if ("WebSocket" in window) {
+    debug("Horray you have web sockets Trying to connect...");
+    ws = new WebSocket("ws://localhost:8010/websockets_test");
+
+    ws.onopen = function() {
+      // Web Socket is connected. You can send data by send() method.
+      debug("connected...");
+      debug("Asking to reverse websockets - ");
+      ws.send("reverse websockets");
+    };
+
+    ws.onmessage = function (evt)
+    {
+      var data = evt.data;
+      debug(data);
+    };
+
+    ws.onclose = function()
+    {
+      debug(" socket closed");
+    };
+  } else {
+    alert("You have no web sockets");
+  };
+
+  function debug(str){
+    $("#debug").append("<p>" +  str);
+  };
+
+
+});
+</script>
+</body>
+</html>
