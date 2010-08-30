@@ -145,8 +145,8 @@ websockets_handshake(Socket) ->
 websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
   receive
     {tcp, Socket, Data} ->
-      {Rest, CState} = handle_data(Buffer, Data, Handler, CState),
-      websockets_wait_messages(Socket, {Rest, Handler, CState});
+      {Rest, NState} = handle_data(Buffer, Data, Handler, CState),
+      websockets_wait_messages(Socket, {Rest, Handler, NState});
     {tcp_closed, Socket} ->
       error_logger:info_msg("WebSockets stream terminated ~n"),
       erlang:apply(Handler, terminate, [CState]),
@@ -159,8 +159,8 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
       erlang:apply(Handler, terminate, [CState]),
       ok;
     Any ->
-      error_logger:info_msg("Got unknown message ~p ~n", [Any]),
-      websockets_wait_messages(Socket, State)
+      NState = erlang:apply(Handler, process_message, [Any, State]),
+      websockets_wait_messages(Socket, NState)
   end.
 %
 handle_data([], [0|T], Handler, State) ->
