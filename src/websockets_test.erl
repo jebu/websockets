@@ -30,7 +30,7 @@
 -module(websockets_test).
 -author('jebu@jebu.net').
 
--export([process_command/2, terminate/1]).
+-export([process_command/2, process_message/2, terminate/1]).
 
 %
 process_command([$r, $e, $v, $e, $r, $s, $e, $ | String], State) ->
@@ -39,6 +39,10 @@ process_command([$r, $e, $v, $e, $r, $s, $e, $ | String], State) ->
   State;
 process_command(_, State) ->
   websockets_server:send("unknown command"),
+  State.
+%
+process_message(Message, State) ->
+  error_logger:info_msg("Unknown message received ~p ~n", [Message]),
   State.
 %
 terminate(_) ->
