@@ -127,14 +127,26 @@ websockets_handshake(Socket) ->
       Origin = proplists:get_value("origin", Headers, "null"),
       Host = proplists:get_value("host", Headers, "localhost:8010"),
       [HandlerString | _] = string:tokens(proplists:get_value("get", Headers, "websockets_handler"), "/ "),
-      Handshake = [
-        "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
-        "Upgrade: WebSocket\r\n",
-        "Connection: Upgrade\r\n",
-        "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
-        "Sec-WebSocket-Location: ws://" ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
-        binary_to_list(CSum)
-      ],
+      Handshake = 
+        case CSum of
+          <<>> -> 
+            [
+              "HTTP/1.1 101 Web Socket Protocol Handshake\r\n",
+              "Upgrade: WebSocket\r\n",
+              "Connection: Upgrade\r\n"
+              "WebSocket-Origin: " ++ Origin ++ "\r\n",
+              "WebSocket-Location: ws://" ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n"
+            ];
+          _ ->
+            [
+              "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
+              "Upgrade: WebSocket\r\n",
+              "Connection: Upgrade\r\n"
+              "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
+              "Sec-WebSocket-Location: ws://" ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
+              binary_to_list(CSum)
+            ]
+        end,
       gen_tcp:send(Socket, Handshake),
       websockets_wait_messages(Socket, {[], list_to_atom(HandlerString), []});
     Any ->
@@ -178,7 +190,12 @@ handle_data(L, [H|T], Handler, State) ->
   handle_data([H|L], T, Handler, State).
 %
 parse_handshake(Bytes) ->
-  {Headers1, CheckSum} = lists:split(length(Bytes) - 8, Bytes),
+  CSumOffset = 
+    case lists:reverse(Bytes) of
+      [10, 13 |_] -> 0;
+      _ -> 8
+    end,
+  {Headers1, CheckSum} = lists:split(length(Bytes) - CSumOffset, Bytes),
   Headers2 = string:tokens(Headers1, "\r\n"),
   {Headers, Key1, Key2} = 
     lists:foldl(fun
@@ -195,9 +212,12 @@ parse_handshake(Bytes) ->
         end;
       (_, Acc) ->
         Acc
-    end, {[], "1", "1"},
+    end, {[], 0, 0},
       [string:tokens(H1, ":") || H1 <- Headers2]),
-  CSum = erlang:md5(<<Key1:32/big, Key2:32/big, (list_to_binary(CheckSum))/binary>>),
+  CSum = case {Key1, Key2} of
+    {0, 0} -> <<>>;
+    _ -> erlang:md5(<<Key1:32/big, Key2:32/big, (list_to_binary(CheckSum))/binary>>)
+  end,
   {Headers, CSum}.
 %
 parse_key(Key) ->
