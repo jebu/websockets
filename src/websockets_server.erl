@@ -33,27 +33,37 @@
 
 -compile([verbose, report_errors, report_warnings, trace, debug_info]).
 -define(TCP_OPTIONS, [list, {active, true}, {reuseaddr, true}, {packet, raw}]).
+-define(SERVER, ?MODULE).
+-define(MAX_CLIENTS, 1024).
 
--export([start_link/2, stop/0]).
+-export([start_link/3, start_link/2, stop/0]).
+
+-export([register_client/1]).
 -export([send/1, send/2, close/0, close/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, 
         terminate/2, code_change/3]).
 
+-record(state, {connected_clients = 0, max_clients = ?MAX_CLIENTS, 
+                listen_socket = undefined, listen_port, listen_interface}).
 % websockets_server external interface
-
 start_link(Port, Interface) ->
+  start_link(Port, Interface, ?MAX_CLIENTS).
+start_link(Port, Interface, MaxClients) ->
   error_logger:info_report([{"WebSockets SERVER STARTS"}]),
-  case gen_server:start_link({local, websockets_server}, websockets_server, [], []) of
+  case gen_server:start_link({local, ?SERVER}, ?MODULE, [Port, Interface, MaxClients], []) of
     {ok, Server} -> 
-      gen_server:call(websockets_server, {listen, Port, Interface}),
+      Server ! {listen},
       {ok, Server};
     {error, {already_started, Server}} -> 
       {ok, Server}
   end.
 
 stop() ->
-  gen_server:call(websockets_server, stop).
+  gen_server:call(?SERVER, stop).
+%
+register_client(ClientPid) ->
+  gen_server:call(?SERVER, {register_client, ClientPid}).
 %
 send(Data) ->
   send(self(), Data).
@@ -68,31 +78,63 @@ close() ->
   close(self()).
 close(Pid) ->
   Pid ! {close}.
+%
 % gen_server callbacks
-init(_Args) ->
+%
+init([Port, Interface, MaxClients]) ->
   process_flag(trap_exit, true),
-  {ok, {}}.
+  {ok, #state{listen_port = Port, listen_interface = Interface, max_clients = MaxClients}}.
+%
+handle_call(stop, _From, State = #state{listen_socket = LSocket}) -> 
+  gen_tcp:close(LSocket),
+  {stop, stop_requested, State#state{listen_socket = undefined}};
 
-handle_call({listen, Port, all}, _From, State) ->
+handle_call({register_client, _}, _, State = #state{connected_clients = A, max_clients = B}) when A >= B ->
+  {reply, {error, max_connect}, State};
+handle_call({register_client, CPid}, _, State = #state{connected_clients = A}) ->
+  erlang:monitor(process, CPid),
+  {reply, ok, State#state{connected_clients = A+1}};
+
+handle_call(_, _, State) ->
+  {reply, ok, State}.
+%
+%
+handle_cast(_, State) ->
+  {noreply, State}.
+%
+%
+handle_info({listen}, State = #state{listen_interface = all, listen_port = Port}) ->
   listen_init(Port, ?TCP_OPTIONS, State);
-
-handle_call({listen, Port, Interface}, _From, State) ->
+handle_info({listen}, State = #state{listen_port = Port, listen_interface = Interface}) ->
   {ok, InterfaceIpAddress} = inet_parse:address(Interface),
   listen_init(Port, [{ip, InterfaceIpAddress} | ?TCP_OPTIONS], State);
 
-handle_call(stop, _From, LSocket) -> 
+handle_info({'DOWN', _, process, _, _}, State = #state{connected_clients = A}) ->
+  {noreply, State#state{connected_clients = A - 1}};
+handle_info({'EXIT', _Pid, _Reason}, State = #state{listen_socket = LSocket}) when LSocket =/= undefined -> 
   gen_tcp:close(LSocket),
-  {stop, stop_requested, []}.
+  {noreply, State#state{listen_socket = undefined}};
 
-handle_info({'EXIT', _Pid, _Reason}, LSocket) -> 
+handle_info(_, State) ->
+  {noreply, State}.
+%
+terminate(_Reason, []) -> 
+  ok;
+terminate(_Reason, #state{listen_socket = LSocket}) when LSocket =/= undefined -> 
   gen_tcp:close(LSocket),
-  {noreply, []}.
+  ok.
+
+code_change(_OldVsn, State, _Extra) -> 
+  {ok, State}.
+
+%
+% internal stuff
 %
 listen_init(Port, TcpOptions, State) ->
   case catch gen_tcp:listen(Port, TcpOptions) of
     {ok, LSocket} -> 
       spawn_link(fun() -> websockets_worker(LSocket) end),
-      {reply, ok, LSocket};
+      {noreply, State#state{listen_socket = LSocket}};
     Error -> 
       {stop, {listen_failed, Error}, State}
   end.
@@ -100,25 +142,17 @@ listen_init(Port, TcpOptions, State) ->
 websockets_worker(LSocket) ->
   case gen_tcp:accept(LSocket) of
     {ok, Socket} -> 
-      CPid = spawn(fun() -> websockets_handshake(Socket) end),
+      CPid = spawn(fun() -> 
+        case register_client(self()) of
+          ok -> websockets_handshake(Socket);
+          E  -> error_logger:info_msg("Client connect disallowed ~p ~n", [E])
+        end
+      end),
       gen_tcp:controlling_process(Socket, CPid),
       websockets_worker(LSocket);
     {error, closed} -> 
       gen_tcp:close(LSocket)
   end.
-        
-% callback stubs
-terminate(_Reason, []) -> 
-  ok;
-terminate(_Reason, LSocket) -> 
-  gen_tcp:close(LSocket),
-  ok.
-
-handle_cast(_Cast, State) -> {noreply, State}.
-
-code_change(_OldVsn, State, _Extra) -> {ok, State}.
-%
-% internal stuff
 %
 websockets_handshake(Socket) ->
   receive
