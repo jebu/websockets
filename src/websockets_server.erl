@@ -206,7 +206,7 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
       ok;
     Any ->
       NState = erlang:apply(Handler, process_message, [Any, State]),
-      websockets_wait_messages(Socket, NState)
+      websockets_wait_messages(Socket, {Buffer, Handler, NState})
   end.
 %
 handle_data([], [0|T], Handler, State) ->
