@@ -32,13 +32,13 @@
 -behaviour(gen_server).
 
 -compile([verbose, report_errors, report_warnings, trace, debug_info]).
--define(TCP_OPTIONS, [list, {active, true}, {reuseaddr, true}, {packet, raw}]).
+-define(TCP_OPTIONS, [list, {active, true}, {reuseaddr, true}, {packet, raw}, {keepalive, true}]).
 -define(SERVER, ?MODULE).
 -define(MAX_CLIENTS, 1024).
 
 -export([start_link/3, start_link/2, stop/0]).
 
--export([register_client/1]).
+-export([register_client/1, get_connected_client_count/0]).
 -export([send/1, send/2, close/0, close/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, 
@@ -64,6 +64,9 @@ stop() ->
 %
 register_client(ClientPid) ->
   gen_server:call(?SERVER, {register_client, ClientPid}).
+%
+get_connected_client_count() ->
+  gen_server:call(?SERVER, get_connected_client_count).
 %
 send(Data) ->
   send(self(), Data).
@@ -95,6 +98,8 @@ handle_call({register_client, CPid}, _, State = #state{connected_clients = A}) -
   erlang:monitor(process, CPid),
   {reply, ok, State#state{connected_clients = A+1}};
 
+handle_call(get_connected_client_count, _, State = #state{connected_clients = A, max_clients = B}) ->
+  {reply, {ok, A, B}, State};
 handle_call(_, _, State) ->
   {reply, ok, State}.
 %
@@ -156,6 +161,9 @@ websockets_worker(LSocket) ->
 %
 websockets_handshake(Socket) ->
   receive
+    {tcp, Socket, "<policy-file-request/>" ++ _} ->
+      gen_tcp:send(Socket, "<cross-domain-policy><allow-access-from domain=\"*\" to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
+      gen_tcp:close(Socket);
     {tcp, Socket, Data} ->
       {Headers, CSum} = parse_handshake(Data),
       Origin = proplists:get_value("origin", Headers, "null"),
@@ -182,7 +190,15 @@ websockets_handshake(Socket) ->
             ]
         end,
       gen_tcp:send(Socket, Handshake),
-      websockets_wait_messages(Socket, {[], list_to_atom(HandlerString), []});
+      HandlerModule = list_to_atom(HandlerString),
+      code:ensure_loaded(HandlerModule),
+      State = 
+        case erlang:function_exported(HandlerModule, init, 1) of
+          true -> erlang:apply(HandlerModule, init, [[]]);
+          false -> []
+        end,
+      websockets_wait_messages(Socket, {[], HandlerModule, State}),
+      gen_tcp:close(Socket);
     Any ->
       error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
       websockets_handshake(Socket)
@@ -193,6 +209,10 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
     {tcp, Socket, Data} ->
       {Rest, NState} = handle_data(Buffer, Data, Handler, CState),
       websockets_wait_messages(Socket, {Rest, Handler, NState});
+    {tcp_error, Socket, Reason} ->
+      error_logger:info_msg("tcp_error on socket ~p ~p ~n", [Socket, Reason]),
+      erlang:apply(Handler, terminate, [CState]),
+      ok;
     {tcp_closed, Socket} ->
       error_logger:info_msg("WebSockets stream terminated ~n"),
       erlang:apply(Handler, terminate, [CState]),
@@ -205,7 +225,7 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
       erlang:apply(Handler, terminate, [CState]),
       ok;
     Any ->
-      NState = erlang:apply(Handler, process_message, [Any, State]),
+      NState = erlang:apply(Handler, process_message, [Any, CState]),
       websockets_wait_messages(Socket, {Buffer, Handler, NState})
   end.
 %
