@@ -89,7 +89,7 @@ init([Port, Interface, MaxClients]) ->
   {ok, #state{listen_port = Port, listen_interface = Interface, max_clients = MaxClients}}.
 %
 handle_call(stop, _From, State = #state{listen_socket = LSocket}) -> 
-  gen_tcp:close(LSocket),
+  iclose(LSocket),
   {stop, stop_requested, State#state{listen_socket = undefined}};
 
 handle_call({register_client, _}, _, State = #state{connected_clients = A, max_clients = B}) when A >= B ->
@@ -117,7 +117,7 @@ handle_info({listen}, State = #state{listen_port = Port, listen_interface = Inte
 handle_info({'DOWN', _, process, _, _}, State = #state{connected_clients = A}) ->
   {noreply, State#state{connected_clients = A - 1}};
 handle_info({'EXIT', _Pid, _Reason}, State = #state{listen_socket = LSocket}) when LSocket =/= undefined -> 
-  gen_tcp:close(LSocket),
+  iclose(LSocket),
   {noreply, State#state{listen_socket = undefined}};
 
 handle_info(_, State) ->
@@ -126,7 +126,7 @@ handle_info(_, State) ->
 terminate(_Reason, []) -> 
   ok;
 terminate(_Reason, #state{listen_socket = LSocket}) when LSocket =/= undefined -> 
-  gen_tcp:close(LSocket),
+  iclose(LSocket),
   ok.
 
 code_change(_OldVsn, State, _Extra) -> 
@@ -156,15 +156,28 @@ websockets_worker(LSocket) ->
       gen_tcp:controlling_process(Socket, CPid),
       websockets_worker(LSocket);
     {error, closed} -> 
-      gen_tcp:close(LSocket)
+      iclose(LSocket)
   end.
 %
 websockets_handshake(Socket) ->
   receive
     {tcp, Socket, "<policy-file-request/>" ++ _} ->
-      gen_tcp:send(Socket, "<cross-domain-policy><allow-access-from domain=\"*\" to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
-      gen_tcp:close(Socket);
-    {tcp, Socket, Data} ->
+      isend(Socket, "<cross-domain-policy><allow-access-from domain=\"*\" 
+                            to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
+      iclose(Socket);
+    {tcp, Socket, Data1} ->
+      {SSocket, Data, Protocol} = case Data1 of
+        [22,_,_,_,_,1|_] ->
+          inet:setopts(Socket, [{active, false}]),
+          gen_tcp:unrecv(Socket, Data1),
+          {ok, SSLSocket} = ssl:ssl_accept(Socket, [{certfile, os:getenv("WS_SERVER_CERTIFICATE")}, 
+                                                    {keyfile, os:getenv("WS_SERVER_KEY")}]),
+          {ok, SData} = ssl:recv(SSLSocket, 0),
+          ssl:setopts(SSLSocket, [{active, true}]),
+          {SSLSocket, SData, "wss://"};
+        _ -> {Socket, Data1, "ws://"}
+      end,
+
       {Headers, CSum} = parse_handshake(Data),
       Origin = proplists:get_value("origin", Headers, "null"),
       Host = proplists:get_value("host", Headers, "localhost:8010"),
@@ -177,7 +190,7 @@ websockets_handshake(Socket) ->
               "Upgrade: WebSocket\r\n",
               "Connection: Upgrade\r\n"
               "WebSocket-Origin: " ++ Origin ++ "\r\n",
-              "WebSocket-Location: ws://" ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n"
+              "WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n"
             ];
           _ ->
             [
@@ -185,11 +198,11 @@ websockets_handshake(Socket) ->
               "Upgrade: WebSocket\r\n",
               "Connection: Upgrade\r\n"
               "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
-              "Sec-WebSocket-Location: ws://" ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
+              "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
               binary_to_list(CSum)
             ]
         end,
-      gen_tcp:send(Socket, Handshake),
+      isend(SSocket, Handshake),
       HandlerModule = list_to_atom(HandlerString),
       code:ensure_loaded(HandlerModule),
       State = 
@@ -197,8 +210,8 @@ websockets_handshake(Socket) ->
           true -> erlang:apply(HandlerModule, init, [[]]);
           false -> []
         end,
-      websockets_wait_messages(Socket, {[], HandlerModule, State}),
-      gen_tcp:close(Socket);
+      websockets_wait_messages(SSocket, {[], HandlerModule, State}),
+      iclose(SSocket);
     Any ->
       error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
       websockets_handshake(Socket)
@@ -206,22 +219,22 @@ websockets_handshake(Socket) ->
 %
 websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
   receive
-    {tcp, Socket, Data} ->
+    {Type, Socket, Data} when Type == tcp; Type == ssl ->
       {Rest, NState} = handle_data(Buffer, Data, Handler, CState),
       websockets_wait_messages(Socket, {Rest, Handler, NState});
-    {tcp_error, Socket, Reason} ->
+    {Type, Socket, Reason} when Type == tcp_error; Type == ssl_error ->
       error_logger:info_msg("tcp_error on socket ~p ~p ~n", [Socket, Reason]),
       erlang:apply(Handler, terminate, [CState]),
       ok;
-    {tcp_closed, Socket} ->
+    {Type, Socket} when Type == tcp_closed; Type == ssl_closed ->
       error_logger:info_msg("WebSockets stream terminated ~n"),
       erlang:apply(Handler, terminate, [CState]),
       ok;
     {send, Data} ->
-      gen_tcp:send(Socket, <<0, Data/binary, 255>>),
+      isend(Socket, <<0, Data/binary, 255>>),
       websockets_wait_messages(Socket, State);
     {close} ->
-      gen_tcp:close(Socket),
+      iclose(Socket),
       erlang:apply(Handler, terminate, [CState]),
       ok;
     Any ->
@@ -287,3 +300,12 @@ parse_key([C | Key], Numbers, Spaces) when C > 47 andalso C < 58 ->
 parse_key([_ | Key], Numbers, Spaces) ->
   parse_key(Key, Numbers, Spaces).
 %
+isend(Socket, Data) when is_tuple(Socket), element(1, Socket) == sslsocket ->
+  ssl:send(Socket, Data);
+isend(Socket, Data) ->
+  gen_tcp:send(Socket, Data).
+%
+iclose(Socket) when is_tuple(Socket), element(1, Socket) == sslsocket ->
+  ssl:close(Socket);
+iclose(Socket) ->
+  gen_tcp:close(Socket).
