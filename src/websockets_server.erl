@@ -179,7 +179,7 @@ websockets_handshake(Socket) ->
           {SSLSocket, SData, "wss://"};
         _ -> {Socket, Data1, "ws://"}
       end,
-
+      
       {Headers, CSum} = parse_handshake(Data),
       Origin = proplists:get_value("origin", Headers, "null"),
       Host = proplists:get_value("host", Headers, "localhost:8010"),
@@ -302,12 +302,12 @@ parse_key([C | Key], Numbers, Spaces) when C > 47 andalso C < 58 ->
 parse_key([_ | Key], Numbers, Spaces) ->
   parse_key(Key, Numbers, Spaces).
 %
-isend(Socket, Data) when is_tuple(Socket), element(1, Socket) == sslsocket ->
+isend(Socket, Data) when is_tuple(Socket) ->
   ssl:send(Socket, Data);
 isend(Socket, Data) ->
   gen_tcp:send(Socket, Data).
 %
-iclose(Socket) when is_tuple(Socket), element(1, Socket) == sslsocket ->
+iclose(Socket) when is_tuple(Socket) ->
   ssl:close(Socket);
 iclose(Socket) ->
   gen_tcp:close(Socket).
