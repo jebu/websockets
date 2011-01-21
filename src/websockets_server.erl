@@ -162,8 +162,8 @@ websockets_worker(LSocket) ->
 websockets_handshake(Socket) ->
   receive
     {tcp, Socket, "<policy-file-request/>" ++ _} ->
-      isend(Socket, "<cross-domain-policy><allow-access-from domain=\"*\" 
-                            to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
+      isend(Socket, "<cross-domain-policy><allow-access-from domain=\"*\"" 
+                    "to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
       iclose(Socket);
     {tcp, Socket, Data1} ->
       {SSocket, Data, Protocol} = case Data1 of
