@@ -3,6 +3,10 @@ WebSockets in Erlang
 
 Taking off from Joe Armstrong's implementation here [http://armstrongonsoftware.blogspot.com/2009/12/comet-is-dead-long-live-websockets.html], this implements key handshake as specified in [http://www.whatwg.org/specs/web-socket-protocol/], and a way of delegating control to user specified module.
 
+Also supports 
+  * flash policy requests
+  * TLS secured websocket connections
+
 A sample handler is specified at src/websockets_test.erl, which simply reverses the string given to it.
 
 Usage
@@ -13,9 +17,14 @@ Usage
   erlc -I include/ -pa ebin/ -o ebin/ src/*.erl
 
 * Startup server
-  erl
+  erl -pa ebin
   > websockets_server:start_link(8010, all).
   >
 
 * Open test page in browser supporting websockets
 
+* To support wss:// pass in server certificate and server key as env variables and start ssl apps 
+  erl -pa ebin -env WS_SERVER_CERTIFICATE <path to server certificate> -env WS_SERVER_KEY <path to server key>
+  > crypto:start().
+  > ssl:start().
+  > websockets_server:start_link(8010, all).

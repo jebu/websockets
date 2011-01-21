@@ -168,6 +168,8 @@ websockets_handshake(Socket) ->
     {tcp, Socket, Data1} ->
       {SSocket, Data, Protocol} = case Data1 of
         [22,_,_,_,_,1|_] ->
+          % this is a TLS client HELLO packet oops push it back in
+          % switch this to SSL and then continue
           inet:setopts(Socket, [{active, false}]),
           gen_tcp:unrecv(Socket, Data1),
           {ok, SSLSocket} = ssl:ssl_accept(Socket, [{certfile, os:getenv("WS_SERVER_CERTIFICATE")}, 
