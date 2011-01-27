@@ -172,8 +172,13 @@ websockets_handshake(Socket) ->
           % switch this to SSL and then continue
           inet:setopts(Socket, [{active, false}]),
           gen_tcp:unrecv(Socket, Data1),
+          CertAdditionals = case os:getenv("WS_CACERT_FILE") of
+            false -> [];
+            CACertFile -> [{cacertfile, CACertFile}]
+          end,
+
           {ok, SSLSocket} = ssl:ssl_accept(Socket, [{certfile, os:getenv("WS_SERVER_CERTIFICATE")}, 
-                                                    {keyfile, os:getenv("WS_SERVER_KEY")}]),
+                                                    {keyfile, os:getenv("WS_SERVER_KEY")} | CertAdditionals]),
           {ok, SData} = ssl:recv(SSLSocket, 0),
           ssl:setopts(SSLSocket, [{active, true}]),
           {SSLSocket, SData, "wss://"};
