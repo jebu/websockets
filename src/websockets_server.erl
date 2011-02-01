@@ -167,7 +167,9 @@ websockets_handshake(Socket) ->
       iclose(Socket);
     {tcp, Socket, Data1} ->
       {SSocket, Data, Protocol} = case Data1 of
-        [22,_,_,_,_,1|_] ->
+        "GET " ++ _ -> {Socket, Data1, "ws://"};
+        "get " ++ _ -> {Socket, Data1, "ws://"};
+        _ ->
           % this is a TLS client HELLO packet oops push it back in
           % switch this to SSL and then continue
           inet:setopts(Socket, [{active, false}]),
@@ -181,10 +183,8 @@ websockets_handshake(Socket) ->
                                                     {keyfile, os:getenv("WS_SERVER_KEY")} | CertAdditionals]),
           {ok, SData} = ssl:recv(SSLSocket, 0),
           ssl:setopts(SSLSocket, [{active, true}]),
-          {SSLSocket, SData, "wss://"};
-        _ -> {Socket, Data1, "ws://"}
+          {SSLSocket, SData, "wss://"}
       end,
-      
       {Headers, CSum} = parse_handshake(Data),
       Origin = proplists:get_value("origin", Headers, "null"),
       Host = proplists:get_value("host", Headers, "localhost:8010"),
