@@ -35,6 +35,7 @@
 -define(TCP_OPTIONS, [list, {active, true}, {reuseaddr, true}, {packet, raw}, {keepalive, true}]).
 -define(SERVER, ?MODULE).
 -define(MAX_CLIENTS, 1024).
+-define(HANDSHAKE_WAIT_TIMEOUT, timer:minutes(2)).
 
 -export([start_link/3, start_link/2, stop/0]).
 
@@ -161,6 +162,10 @@ websockets_worker(LSocket) ->
 %
 websockets_handshake(Socket) ->
   receive
+    {tcp_closed, Socket} ->
+      iclose(Socket);
+    {tcp_error, Socket, _} ->
+      iclose(Socket);
     {tcp, Socket, "<policy-file-request/>" ++ _} ->
       isend(Socket, "<cross-domain-policy><allow-access-from domain=\"*\"" 
                     "to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
@@ -222,6 +227,10 @@ websockets_handshake(Socket) ->
     Any ->
       error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
       websockets_handshake(Socket)
+  after
+    ?HANDSHAKE_WAIT_TIMEOUT -> 
+      error_logger:info_msg("Timed out waiting for handshake."),
+      iclose(Socket)
   end.
 %
 websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
