@@ -235,6 +235,9 @@ websockets_handshake(Socket) ->
 %
 websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
   receive
+    {_Type, Socket, [255,0]} ->
+      isend(Socket, <<255,0>>),
+      websockets_wait_messages(Socket, State);
     {Type, Socket, Data} when Type == tcp; Type == ssl ->
       {Rest, NState} = handle_data(Buffer, Data, Handler, CState),
       websockets_wait_messages(Socket, {Rest, Handler, NState});
