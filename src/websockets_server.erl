@@ -162,9 +162,9 @@ websockets_worker(LSocket) ->
 %
 websockets_handshake(Socket) ->
   receive
-    {tcp_closed, Socket} ->
+    {tcp_closed, _} ->
       iclose(Socket);
-    {tcp_error, Socket, _} ->
+    {tcp_error, _, _} ->
       iclose(Socket);
     {tcp, Socket, "<policy-file-request/>" ++ _} ->
       isend(Socket, "<cross-domain-policy><allow-access-from domain=\"*\"" 
@@ -236,6 +236,7 @@ websockets_handshake(Socket) ->
 websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
   receive
     {_Type, Socket, [255,0]} ->
+      % close handshake
       isend(Socket, <<255,0>>),
       websockets_wait_messages(Socket, State);
     {Type, Socket, Data} when Type == tcp; Type == ssl ->
@@ -250,7 +251,12 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
       erlang:apply(Handler, terminate, [CState]),
       ok;
     {send, Data} ->
-      isend(Socket, <<0, Data/binary, 255>>),
+      case isend(Socket, <<0, Data/binary, 255>>) of
+        {error, Reason} ->
+          error_logger:info_msg("tcp_error on send ~p ~p ~n", [Socket, Reason]),
+          self() ! {close};
+        _ -> ok
+      end,
       websockets_wait_messages(Socket, State);
     {close} ->
       iclose(Socket),
