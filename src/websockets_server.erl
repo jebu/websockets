@@ -193,9 +193,23 @@ websockets_handshake(Socket) ->
       {Headers, CSum} = parse_handshake(Data),
       Origin = proplists:get_value("origin", Headers, "null"),
       Host = proplists:get_value("host", Headers, "localhost:8010"),
+      Version = proplists:get_value("sec-websocket-version", Headers, undefined),
       [HandlerString | _] = string:tokens(proplists:get_value("get", Headers, "websockets_handler"), "/ "),
       Handshake = 
         case CSum of
+          <<>> when Version =:= "8"; Version =:= "6" ->
+            ClientKey = proplists:get_value("sec-websocket-key", Headers, ""),
+            ServerResponse = binary_to_list(
+              base64:encode(
+                crypto:sha([ClientKey, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"]))),
+            [
+              "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
+              "Upgrade: WebSocket\r\n",
+              "Connection: Upgrade\r\n"
+              "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
+              "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n",
+              "Sec-WebSocket-Accept: " ++ ServerResponse ++ "\r\n\r\n"
+            ];
           <<>> -> 
             [
               "HTTP/1.1 101 Web Socket Protocol Handshake\r\n",
@@ -222,7 +236,7 @@ websockets_handshake(Socket) ->
           true -> erlang:apply(HandlerModule, init, [[]]);
           false -> []
         end,
-      websockets_wait_messages(SSocket, {[], HandlerModule, State}),
+      websockets_wait_messages(SSocket, {[], HandlerModule, Version, State}),
       iclose(SSocket);
     Any ->
       error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
@@ -233,15 +247,32 @@ websockets_handshake(Socket) ->
       iclose(Socket)
   end.
 %
-websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
+websockets_wait_messages(Socket, State = {Buffer, Handler, Version, CState}) ->
   receive
     {_Type, Socket, [255,0]} ->
       % close handshake
       isend(Socket, <<255,0>>),
       websockets_wait_messages(Socket, State);
     {Type, Socket, Data} when Type == tcp; Type == ssl ->
-      {Rest, NState} = handle_data(Buffer, Data, Handler, CState),
-      websockets_wait_messages(Socket, {Rest, Handler, NState});
+      {Rest, NState} = case decode_data(Version, Data) of
+        {close, CCode, CReason} ->
+          isend(Socket, make_packet(Version, {close, CCode, CReason})),
+          {Buffer, State};
+        {ping, _PData} ->
+          %ignore for now
+          {Buffer, State};
+        {pong, _PData} ->
+          %ignore for now
+          {Buffer, State};
+        {text, PData} ->
+          NewCState = erlang:apply(Handler, process_command, [PData, CState]),
+          {Buffer, NewCState};
+          %handle_data(Buffer, PData, Handler, CState);
+        Unknown ->
+          error_logger:info_msg("Unknown packet ~p ~n", [Unknown]),
+          {Buffer, State}
+      end,
+      websockets_wait_messages(Socket, {Rest, Handler, Version, NState});
     {Type, Socket, Reason} when Type == tcp_error; Type == ssl_error ->
       error_logger:info_msg("tcp_error on socket ~p ~p ~n", [Socket, Reason]),
       erlang:apply(Handler, terminate, [CState]),
@@ -251,7 +282,7 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
       erlang:apply(Handler, terminate, [CState]),
       ok;
     {send, Data} ->
-      case isend(Socket, <<0, Data/binary, 255>>) of
+      case isend(Socket, make_packet(Version, {text, Data})) of
         {error, Reason} ->
           error_logger:info_msg("tcp_error on send ~p ~p ~n", [Socket, Reason]),
           self() ! {close};
@@ -259,12 +290,13 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, CState}) ->
       end,
       websockets_wait_messages(Socket, State);
     {close} ->
+      isend(Socket, make_packet(Version, {close, 1005, <<>>})),
       iclose(Socket),
       erlang:apply(Handler, terminate, [CState]),
       ok;
     Any ->
       NState = erlang:apply(Handler, process_message, [Any, CState]),
-      websockets_wait_messages(Socket, {Buffer, Handler, NState})
+      websockets_wait_messages(Socket, {Buffer, Handler, Version, NState})
   end.
 %
 handle_data([], [0|T], Handler, State) ->
@@ -334,3 +366,92 @@ iclose(Socket) when is_tuple(Socket) ->
   ssl:close(Socket);
 iclose(Socket) ->
   gen_tcp:close(Socket).
+%
+decode_data("8", Data) -> decode_version8(Data);
+decode_data(_, [255,0]) -> {close, undefined, undefined};
+decode_data(_, Data) ->{text, Data}.
+%
+%
+decode_version8(Data) when is_list(Data) -> decode_version8(list_to_binary(Data));
+decode_version8(Data) when is_binary(Data) ->
+  << _FIN:1, _RSV1:1, _RSV2:1, _RSV3:1, OPCODE:4, MASK:1, PLen:7, Rest/binary>> = Data,
+  {_Length, RestPacket} = case PLen of
+    126 -> 
+      <<ALen:16, ARest/binary>> = Rest,
+      {ALen, ARest};
+    127 ->
+      <<ALen:64, ARest/binary>> = Rest,
+      {ALen, ARest};
+    _ ->
+      {PLen, Rest}
+  end,
+  {Mask, PayLoad} = case MASK of
+    1 -> 
+      <<MaskData:32, PLoad/binary>> = RestPacket,
+      {<<MaskData:32>>, PLoad};
+    _ ->
+      {<<0:32>>, RestPacket}
+  end,
+  UnmaskedData = unmask(PayLoad, Mask),
+  case OPCODE of
+    0 -> {continuation, binary_to_list(UnmaskedData)};
+    1 -> {text, unicode:characters_to_list(UnmaskedData)};
+    2 -> {binary, binary_to_list(UnmaskedData)};
+    8 -> 
+      case UnmaskedData of
+        <<>> -> {close, 1005, <<>>};
+        <<Code:16, Reason/binary>> -> {close, Code, Reason}
+      end;
+    9 -> {ping, binary_to_list(UnmaskedData)};
+    10 -> {pong, binary_to_list(UnmaskedData)};
+    _ -> {unknown, OPCODE, binary_to_list(UnmaskedData)}
+  end.
+%
+%
+unmask(PayLoad, 0) -> PayLoad;
+unmask(PayLoad, Mask) -> unmask(PayLoad, Mask, <<>>).
+%
+unmask(<<Frame:32, Rest/binary>>, <<Mask:32>> = MaskB, Acc) ->
+  unmask(Rest, MaskB, <<Acc/binary, (Frame bxor Mask):32>>);
+unmask(<<Frame:24>>, <<Mask:24, _/binary>>, Acc) ->
+  <<Acc/binary, (Frame bxor Mask):24>>;
+unmask(<<Frame:16>>, <<Mask:16, _/binary>>, Acc) ->
+  <<Acc/binary, (Frame bxor Mask):16>>;
+unmask(<<Frame:8>>, <<Mask:8, _/binary>>, Acc) ->
+  <<Acc/binary, (Frame bxor Mask):8>>;
+unmask(<<>>, _, Acc) -> Acc.
+%
+make_packet("8", Packet) -> encode_version8(Packet);
+make_packet(_, {close,_,_}) -> <<255,0>>;
+make_packet(_, {text, Data}) when is_binary(Data) -> <<0, Data/binary, 255>>;
+make_packet(_, {text, Data}) when is_list(Data) -> <<0, (list_to_binary(Data))/binary, 255>>;
+make_packet(_, _) -> <<>>.
+%
+encode_version8({close, Code, Reason}) ->
+  Data = <<Code:16, Reason/binary>>,
+  frame_data(close, Data);
+encode_version8({text, Data}) ->
+  frame_data(text, Data);
+encode_version8(Req) ->
+  error_logger:info_msg("unknown encoding req ~p ~n", [Req]),
+  frame_data(text, <<>>).
+%
+frame_data(Type, <<>>) -> 
+  FrameHeader = get_frame_header(Type),
+  <<FrameHeader:8, 0:8>>;
+frame_data(Type, Data) -> 
+  FrameHeader = get_frame_header(Type),
+  LengthHeader = get_length_header(size(Data)),
+  <<FrameHeader/binary, LengthHeader/binary, Data/binary>>.
+%
+get_frame_header(continuation) -> <<8:4,0:4>>;
+get_frame_header(text) -> <<8:4,1:4>>;
+get_frame_header(binary) -> <<8:4,2:4>>;
+get_frame_header(close) -> <<8:4,8:4>>;
+get_frame_header(ping) -> <<8:4,9:4>>;
+get_frame_header(pong) -> <<8:4,10:4>>;
+get_frame_header(_) -> <<8:4,15:4>>.
+%
+get_length_header(Length) when Length < 126 -> <<0:1, Length:7>>;
+get_length_header(Length) when Length < (1 bsl 16) -> <<0:1, 126:7, Length:16>>;
+get_length_header(Length) -> <<0:1, 127:7, Length:64>>.
