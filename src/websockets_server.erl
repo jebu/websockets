@@ -369,7 +369,8 @@ iclose(Socket) ->
 %
 decode_data("8", Data) -> decode_version8(Data);
 decode_data(_, [255,0]) -> {close, undefined, undefined};
-decode_data(_, Data) ->{text, Data}.
+decode_data(_, [0|Data]) -> {text, lists:sublist(Data, length(Data) - 1)};
+decode_data(_, Data) -> {unknown, Data}.
 %
 %
 decode_version8(Data) when is_list(Data) -> decode_version8(list_to_binary(Data));
