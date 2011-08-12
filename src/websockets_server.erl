@@ -40,7 +40,7 @@
 -export([start_link/3, start_link/2, stop/0]).
 
 -export([register_client/1, get_connected_client_count/0]).
--export([send/1, send/2, close/0, close/1, handle_data/4]).
+-export([send/1, send/2, close/0, close/1]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, 
         terminate/2, code_change/3]).
@@ -236,7 +236,7 @@ websockets_handshake(Socket) ->
           true -> erlang:apply(HandlerModule, init, [[]]);
           false -> []
         end,
-      websockets_wait_messages(SSocket, {[], HandlerModule, Version, State}),
+      websockets_wait_messages(SSocket, {<<>>, HandlerModule, Version, State}),
       iclose(SSocket);
     Any ->
       error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
@@ -249,30 +249,9 @@ websockets_handshake(Socket) ->
 %
 websockets_wait_messages(Socket, State = {Buffer, Handler, Version, CState}) ->
   receive
-    {_Type, Socket, [255,0]} ->
-      % close handshake
-      isend(Socket, <<255,0>>),
-      websockets_wait_messages(Socket, State);
     {Type, Socket, Data} when Type == tcp; Type == ssl ->
-      {Rest, NState} = case decode_data(Version, Data) of
-        {incomplete} -> {lists:append(Buffer, Data), State};
-        {close, CCode, CReason} ->
-          isend(Socket, make_packet(Version, {close, CCode, CReason})),
-          {Buffer, State};
-        {ping, _PData} ->
-          %ignore for now
-          {Buffer, State};
-        {pong, _PData} ->
-          %ignore for now
-          {Buffer, State};
-        {text, PData} ->
-          NewCState = erlang:apply(Handler, process_command, [PData, CState]),
-          {Buffer, NewCState};
-          %handle_data(Buffer, PData, Handler, CState);
-        Unknown ->
-          error_logger:info_msg("Unknown packet ~p ~n", [Unknown]),
-          {Buffer, State}
-      end,
+      BinData = list_to_binary(Data),
+      {Rest, NState} = handle_data(<<Buffer/binary, BinData/binary>>, Version, Handler, CState),
       websockets_wait_messages(Socket, {Rest, Handler, Version, NState});
     {Type, Socket, Reason} when Type == tcp_error; Type == ssl_error ->
       error_logger:info_msg("tcp_error on socket ~p ~p ~n", [Socket, Reason]),
@@ -295,24 +274,37 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, Version, CState}) ->
       iclose(Socket),
       erlang:apply(Handler, terminate, [CState]),
       ok;
+    {close, CCode, CReason} ->
+      isend(Socket, make_packet(Version, {close, CCode, CReason})),
+      iclose(Socket),
+      erlang:apply(Handler, terminate, [CState]),
+      ok;
     Any ->
       NState = erlang:apply(Handler, process_message, [Any, CState]),
       websockets_wait_messages(Socket, {Buffer, Handler, Version, NState})
   end.
 %
-handle_data([], [0|T], Handler, State) ->
-  handle_data([], T, Handler, State);
-handle_data(Buffer, [], _, State) ->
-  {Buffer, State};
-handle_data(Buffer, T, Handler, State) when length(Buffer) > 512 ->
-  % too many bytes in buffer we skip
-  handle_data([], T, Handler, State);
-handle_data(L, [255|T], Handler, State) ->
-  Line = lists:reverse(L),
-  NState = erlang:apply(Handler, process_command, [Line, State]),
-  handle_data([], T, Handler, NState);
-handle_data(L, [H|T], Handler, State) ->
-  handle_data([H|L], T, Handler, State).
+handle_data(Data, Version, Handler, State) ->
+  case decode_data(Version, Data) of
+    {incomplete} -> {Data, State};
+    {close, CCode, CReason} ->
+      self() ! {close, CCode, CReason},
+      {<<>>, State};
+    {ping, _PData, Extra} ->
+      %ignore for now
+      handle_data(Extra, Version, Handler, State);
+    {pong, _PData, Extra} ->
+      %ignore for now
+      handle_data(Extra, Version, Handler, State);
+    {text, PData, Extra} ->
+      NewCState = erlang:apply(Handler, process_command, [PData, State]),
+      handle_data(Extra, Version, Handler, NewCState);
+    {_,_,Extra} ->
+      handle_data(Extra, Version, Handler, State);
+    {unknown, OpCode, _, Extra} ->
+      error_logger:info_msg("Unknown packet ~p ~n", [OpCode]),
+      handle_data(Extra, Version, Handler, State)
+  end.
 %
 parse_handshake(Bytes) ->
   CSumOffset = 
@@ -368,11 +360,15 @@ iclose(Socket) when is_tuple(Socket) ->
 iclose(Socket) ->
   gen_tcp:close(Socket).
 %
+decode_data(_, <<>>) -> {incomplete};
 decode_data("8", Data) -> decode_version8(Data);
-decode_data(_, [255,0]) -> {close, undefined, undefined};
-decode_data(_, [0|Data]) -> 
-  case lists:split(length(Data) - 1, Data) of
-    [PData, [255]] -> {text, PData};
+decode_data(_, <<255,0>>) -> {close, undefined, undefined};
+decode_data(_, <<0:8, Data/binary>>) -> 
+  case binary:last(Data) of
+    255 -> 
+      ASize = size(Data) -1,
+      <<AData:ASize/binary, 255:8>> = Data,
+      {text, unicode:characters_to_list(AData)};
     _ -> {incomplete}
   end;
 decode_data(_, Data) -> {unknown, Data}.
@@ -398,20 +394,27 @@ decode_version8(Data) when is_binary(Data) ->
     _ ->
       {<<0:32>>, RestPacket}
   end,
-  UnmaskedData = unmask(PayLoad, Mask),
+  {UnmaskedData, Extra} = 
+    case Length > size(PayLoad) of
+      true -> {<<>>, Data};
+      _ -> 
+        <<APayLoad:Length/binary, EExtra/binary>> = PayLoad,
+        {unmask(APayLoad, Mask), EExtra}
+    end,
+
   case OPCODE of
     _ when Length =/= size(PayLoad) -> {incomplete};
-    0 -> {continuation, binary_to_list(UnmaskedData)};
-    1 -> {text, unicode:characters_to_list(UnmaskedData)};
-    2 -> {binary, binary_to_list(UnmaskedData)};
+    0 -> {continuation, binary_to_list(UnmaskedData), Extra};
+    1 -> {text, unicode:characters_to_list(UnmaskedData), Extra};
+    2 -> {binary, binary_to_list(UnmaskedData), Extra};
     8 -> 
       case UnmaskedData of
         <<>> -> {close, 1005, <<>>};
         <<Code:16, Reason/binary>> -> {close, Code, Reason}
       end;
-    9 -> {ping, binary_to_list(UnmaskedData)};
-    10 -> {pong, binary_to_list(UnmaskedData)};
-    _ -> {unknown, OPCODE, binary_to_list(UnmaskedData)}
+    9 -> {ping, binary_to_list(UnmaskedData), Extra};
+    10 -> {pong, binary_to_list(UnmaskedData), Extra};
+    _ -> {unknown, OPCODE, binary_to_list(UnmaskedData), Extra}
   end.
 %
 %
