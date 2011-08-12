@@ -40,7 +40,7 @@
 -export([start_link/3, start_link/2, stop/0]).
 
 -export([register_client/1, get_connected_client_count/0]).
--export([send/1, send/2, close/0, close/1]).
+-export([send/1, send/2, close/0, close/1, handle_data/4]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, 
         terminate/2, code_change/3]).
