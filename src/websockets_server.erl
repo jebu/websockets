@@ -255,6 +255,7 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, Version, CState}) ->
       websockets_wait_messages(Socket, State);
     {Type, Socket, Data} when Type == tcp; Type == ssl ->
       {Rest, NState} = case decode_data(Version, Data) of
+        {incomplete} -> {lists:append(Buffer, Data), State};
         {close, CCode, CReason} ->
           isend(Socket, make_packet(Version, {close, CCode, CReason})),
           {Buffer, State};
@@ -369,14 +370,18 @@ iclose(Socket) ->
 %
 decode_data("8", Data) -> decode_version8(Data);
 decode_data(_, [255,0]) -> {close, undefined, undefined};
-decode_data(_, [0|Data]) -> {text, lists:sublist(Data, length(Data) - 1)};
+decode_data(_, [0|Data]) -> 
+  case lists:split(length(Data) - 1, Data) of
+    [PData, [255]] -> {text, PData};
+    _ -> {incomplete}
+  end;
 decode_data(_, Data) -> {unknown, Data}.
 %
 %
 decode_version8(Data) when is_list(Data) -> decode_version8(list_to_binary(Data));
 decode_version8(Data) when is_binary(Data) ->
   << _FIN:1, _RSV1:1, _RSV2:1, _RSV3:1, OPCODE:4, MASK:1, PLen:7, Rest/binary>> = Data,
-  {_Length, RestPacket} = case PLen of
+  {Length, RestPacket} = case PLen of
     126 -> 
       <<ALen:16, ARest/binary>> = Rest,
       {ALen, ARest};
@@ -395,6 +400,7 @@ decode_version8(Data) when is_binary(Data) ->
   end,
   UnmaskedData = unmask(PayLoad, Mask),
   case OPCODE of
+    _ when Length =/= size(PayLoad) -> {incomplete};
     0 -> {continuation, binary_to_list(UnmaskedData)};
     1 -> {text, unicode:characters_to_list(UnmaskedData)};
     2 -> {binary, binary_to_list(UnmaskedData)};
