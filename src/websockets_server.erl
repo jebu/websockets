@@ -286,7 +286,8 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, Version, CState}) ->
 %
 handle_data(Data, Version, Handler, State) ->
   case decode_data(Version, Data) of
-    {incomplete} -> {Data, State};
+    {incomplete} -> 
+      {Data, State};
     {close, CCode, CReason} ->
       self() ! {close, CCode, CReason},
       {<<>>, State};
@@ -403,7 +404,7 @@ decode_version8(Data) when is_binary(Data) ->
     end,
 
   case OPCODE of
-    _ when Length =/= size(PayLoad) -> {incomplete};
+    _ when Length > size(PayLoad) -> {incomplete};
     0 -> {continuation, binary_to_list(UnmaskedData), Extra};
     1 -> {text, unicode:characters_to_list(UnmaskedData), Extra};
     2 -> {binary, binary_to_list(UnmaskedData), Extra};
