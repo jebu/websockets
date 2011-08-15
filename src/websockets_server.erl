@@ -365,11 +365,8 @@ decode_data(_, <<>>) -> {incomplete};
 decode_data("8", Data) -> decode_version8(Data);
 decode_data(_, <<255,0>>) -> {close, undefined, undefined};
 decode_data(_, <<0:8, Data/binary>>) -> 
-  case binary:last(Data) of
-    255 -> 
-      ASize = size(Data) -1,
-      <<AData:ASize/binary, 255:8>> = Data,
-      {text, unicode:characters_to_list(AData)};
+  case binary:split(Data, <<255>>) of
+    [PData, Rest] -> {text, unicode:characters_to_list(PData), Rest};
     _ -> {incomplete}
   end;
 decode_data(_, Data) -> {unknown, Data}.
