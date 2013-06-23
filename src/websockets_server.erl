@@ -197,7 +197,7 @@ websockets_handshake(Socket) ->
       [HandlerString | _] = string:tokens(proplists:get_value("get", Headers, "websockets_handler"), "/ "),
       Handshake = 
         case CSum of
-          <<>> when Version =:= "8"; Version =:= "6" ->
+          <<>> when Version =:= "13"; Version =:= "8"; Version =:= "6" ->
             ClientKey = proplists:get_value("sec-websocket-key", Headers, ""),
             ServerResponse = binary_to_list(
               base64:encode(
@@ -206,6 +206,7 @@ websockets_handshake(Socket) ->
               "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
               "Upgrade: WebSocket\r\n",
               "Connection: Upgrade\r\n"
+              "Sec-WebSocket-Version: 13, 8, 6\r\n"
               "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
               "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n",
               "Sec-WebSocket-Accept: " ++ ServerResponse ++ "\r\n\r\n"
@@ -270,7 +271,7 @@ websockets_wait_messages(Socket, State = {Buffer, Handler, Version, CState}) ->
       end,
       websockets_wait_messages(Socket, State);
     {close} ->
-      isend(Socket, make_packet(Version, {close, 1005, <<>>})),
+      isend(Socket, make_packet(Version, {close, 1000, <<>>})),
       iclose(Socket),
       erlang:apply(Handler, terminate, [CState]),
       ok;
@@ -362,6 +363,7 @@ iclose(Socket) ->
   gen_tcp:close(Socket).
 %
 decode_data(_, <<>>) -> {incomplete};
+decode_data("13", Data) -> decode_version8(Data);
 decode_data("8", Data) -> decode_version8(Data);
 decode_data(_, <<255,0>>) -> {close, undefined, undefined};
 decode_data(_, <<0:8, Data/binary>>) -> 
@@ -430,6 +432,7 @@ unmask(<<Frame:8>>, <<Mask:8, _/binary>>, Acc) ->
 unmask(<<>>, _, Acc) -> Acc.
 %
 make_packet("8", Packet) -> encode_version8(Packet);
+make_packet("13", Packet) -> encode_version8(Packet);
 make_packet(_, {close,_,_}) -> <<255,0>>;
 make_packet(_, {text, Data}) when is_binary(Data) -> <<0, Data/binary, 255>>;
 make_packet(_, {text, Data}) when is_list(Data) -> <<0, (list_to_binary(Data))/binary, 255>>;
