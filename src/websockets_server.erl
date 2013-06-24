@@ -161,6 +161,9 @@ websockets_worker(LSocket) ->
   end.
 %
 websockets_handshake(Socket) ->
+  websockets_handshake(Socket, []).
+%
+websockets_handshake(Socket, DBuffer) ->
   receive
     {tcp_closed, _} ->
       iclose(Socket);
@@ -170,7 +173,8 @@ websockets_handshake(Socket) ->
       isend(Socket, "<cross-domain-policy><allow-access-from domain=\"*\"" 
                     "to-ports=\"*\" /></cross-domain-policy>" ++ [0]),
       iclose(Socket);
-    {tcp, Socket, Data1} ->
+    {tcp, Socket, DBuffer1} ->
+      Data1 = DBuffer ++ DBuffer1,
       {SSocket, Data, Protocol} = case Data1 of
         "GET " ++ _ -> {Socket, Data1, "ws://"};
         "get " ++ _ -> {Socket, Data1, "ws://"};
@@ -190,58 +194,63 @@ websockets_handshake(Socket) ->
           ssl:setopts(SSLSocket, [{active, true}]),
           {SSLSocket, SData, "wss://"}
       end,
-      {Headers, CSum} = parse_handshake(Data),
-      Origin = proplists:get_value("origin", Headers, "null"),
-      Host = proplists:get_value("host", Headers, "localhost:8010"),
-      Version = proplists:get_value("sec-websocket-version", Headers, undefined),
-      [HandlerString | _] = string:tokens(proplists:get_value("get", Headers, "websockets_handler"), "/ "),
-      Handshake = 
-        case CSum of
-          <<>> when Version =:= "13"; Version =:= "8"; Version =:= "6" ->
-            ClientKey = proplists:get_value("sec-websocket-key", Headers, ""),
-            ServerResponse = binary_to_list(
-              base64:encode(
-                crypto:sha([ClientKey, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"]))),
-            [
-              "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
-              "Upgrade: WebSocket\r\n",
-              "Connection: Upgrade\r\n"
-              "Sec-WebSocket-Version: 13, 8, 6\r\n"
-              "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
-              "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n",
-              "Sec-WebSocket-Accept: " ++ ServerResponse ++ "\r\n\r\n"
-            ];
-          <<>> -> 
-            [
-              "HTTP/1.1 101 Web Socket Protocol Handshake\r\n",
-              "Upgrade: WebSocket\r\n",
-              "Connection: Upgrade\r\n"
-              "WebSocket-Origin: " ++ Origin ++ "\r\n",
-              "WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n"
-            ];
-          _ ->
-            [
-              "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
-              "Upgrade: WebSocket\r\n",
-              "Connection: Upgrade\r\n"
-              "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
-              "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
-              binary_to_list(CSum)
-            ]
-        end,
-      isend(SSocket, Handshake),
-      HandlerModule = list_to_atom(HandlerString),
-      code:ensure_loaded(HandlerModule),
-      State = 
-        case erlang:function_exported(HandlerModule, init, 1) of
-          true -> erlang:apply(HandlerModule, init, [[]]);
-          false -> []
-        end,
-      websockets_wait_messages(SSocket, {<<>>, HandlerModule, Version, State}),
-      iclose(SSocket);
+      case lists:nthtail(length(Data)-4, Data) of
+        [13,10,13,10] ->
+          {Headers, CSum} = parse_handshake(Data),
+          Origin = proplists:get_value("origin", Headers, "null"),
+          Host = proplists:get_value("host", Headers, "localhost:8010"),
+          Version = proplists:get_value("sec-websocket-version", Headers, undefined),
+          [HandlerString | _] = string:tokens(proplists:get_value("get", Headers, "websockets_handler"), "/ "),
+          Handshake = 
+            case CSum of
+              <<>> when Version =:= "13"; Version =:= "8"; Version =:= "6" ->
+                ClientKey = proplists:get_value("sec-websocket-key", Headers, ""),
+                ServerResponse = binary_to_list(
+                  base64:encode(
+                    crypto:sha([ClientKey, "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"]))),
+                [
+                  "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
+                  "Upgrade: WebSocket\r\n",
+                  "Connection: Upgrade\r\n",
+                  "Sec-WebSocket-Version: 13, 8, 6\r\n",
+                  "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
+                  "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n",
+                  "Sec-WebSocket-Accept: " ++ ServerResponse ++ "\r\n\r\n"
+                ];
+              <<>> -> 
+                [
+                  "HTTP/1.1 101 Web Socket Protocol Handshake\r\n",
+                  "Upgrade: WebSocket\r\n",
+                  "Connection: Upgrade\r\n"
+                  "WebSocket-Origin: " ++ Origin ++ "\r\n",
+                  "WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n"
+                ];
+              _ ->
+                [
+                  "HTTP/1.1 101 WebSocket Protocol Handshake\r\n",
+                  "Upgrade: WebSocket\r\n",
+                  "Connection: Upgrade\r\n"
+                  "Sec-WebSocket-Origin: " ++ Origin ++ "\r\n",
+                  "Sec-WebSocket-Location: " ++ Protocol ++ Host ++ "/" ++ HandlerString ++ "\r\n\r\n",
+                  binary_to_list(CSum)
+                ]
+            end,
+          isend(SSocket, Handshake),
+          HandlerModule = list_to_atom(HandlerString),
+          code:ensure_loaded(HandlerModule),
+          State = 
+            case erlang:function_exported(HandlerModule, init, 1) of
+              true -> erlang:apply(HandlerModule, init, [[]]);
+              false -> []
+            end,
+          websockets_wait_messages(SSocket, {<<>>, HandlerModule, Version, State}),
+          iclose(SSocket);
+        _ ->
+          websockets_handshake(SSocket, Data)
+      end;
     Any ->
       error_logger:info_msg("Received ~p waiting for handshake: ~n",[Any]),
-      websockets_handshake(Socket)
+      websockets_handshake(Socket,DBuffer)
   after
     ?HANDSHAKE_WAIT_TIMEOUT -> 
       error_logger:info_msg("Timed out waiting for handshake."),
